@@ -48,6 +48,229 @@ class WarehouseSolver:
         if not required_columns.issubset(self.orders.columns):
             raise ValueError(f"Missing required columns: {required_columns - set(self.orders.columns)}")
 
+
+
+# ZONE 거리 클러스팅 -> sku 주문빈도 및 연관성 클러스팅 -> ZONE 크기로 sku 더미 생성 -> 그리드 휴리스틱으로 더미끼리의 연관성 파악 -> 연관성 기반 zone 매핑 -> zone 내에 배치 전략 적용
+    def solve_storage_location(self) -> None:
+        """Solve SLAP using:
+           - SKU 빈도·연관성 기반 클러스터링
+           - Spectral Clustering 으로 랙 Zone 분할
+           - 그리디 휴리스틱으로 Zone 순서 결정
+           - 랙 내부 정렬(빈도+연관성 기반)"""
+        from collections import defaultdict
+        from itertools import combinations
+        import numpy as np
+        from sklearn.cluster import SpectralClustering
+
+        # 1. SKU 출고 빈도 계산
+        if 'NUM_PCS' in self.orders.columns:
+            freq = self.orders.groupby('SKU_CD')['NUM_PCS'].sum()
+        else:
+            freq = self.orders.groupby('SKU_CD').size()
+        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+
+        # 2. SKU 공동 주문 연관성 계산
+        cooc = defaultdict(int)
+        for _, grp in self.orders.groupby('ORD_NO'):
+            items = grp['SKU_CD'].tolist()
+            for a, b in combinations(items, 2):
+                cooc[(a, b)] += 1
+                cooc[(b, a)] += 1
+
+        # 3. 랙 위치 및 거리 준비
+        rack_labels = list(self.od_matrix.index[2:])  # WP_000x...
+        D = self.od_matrix.loc[rack_labels, rack_labels].values
+        sigma = np.std(D)
+        S = np.exp(-D**2 / (2 * sigma**2))  # 가우시안 유사도
+
+        # 4. Spectral Clustering 으로 랙을 Zone 분할
+        n_zones = int(np.ceil(len(skus_by_freq) / self.params.rack_capacity))
+        clustering = SpectralClustering(
+            n_clusters=n_zones,
+            affinity='precomputed',
+            assign_labels='kmeans',
+            random_state=0
+        )
+        labels = clustering.fit_predict(S)
+        zone_to_racks = defaultdict(list)
+        rack_to_zone = {}
+        for rack, z in zip(rack_labels, labels):
+            zone_to_racks[z].append(rack)
+            rack_to_zone[rack] = z
+
+        # 5. 초기 Zone 순서: 입구 기준 거리만으로 정렬
+        dist_start = self.od_matrix.loc[self.start_location, rack_labels]
+        zone_dist = {
+            z: np.mean([dist_start[r] for r in racks])
+            for z, racks in zone_to_racks.items()
+        }
+        initial_ordered_zones = sorted(zone_to_racks.keys(), key=lambda z: zone_dist[z])
+        initial_rack_sorted = []
+        for z in initial_ordered_zones:
+            racks = zone_to_racks[z][:]
+            racks.sort(key=lambda r: dist_start[r])
+            initial_rack_sorted.extend(racks)
+
+        # 6. SKU 클러스터링 (빈도+연관성 기반)
+        assigned = set()
+        clusters = []
+        for sku in skus_by_freq:
+            if sku in assigned:
+                continue
+            cluster = {sku}
+            candidates = [s for s in skus_by_freq if s not in assigned]
+            candidates.sort(key=lambda x: cooc.get((sku, x), 0), reverse=True)
+            for c in candidates:
+                if len(cluster) < self.params.rack_capacity:
+                    cluster.add(c)
+                else:
+                    break
+            assigned |= cluster
+            clusters.append(cluster)
+
+        # 7. 초기 SKU→랙 매핑 및 SKU→Zone 매핑
+        sku_to_initial_rack = {}
+        for i, cluster in enumerate(clusters):
+            rack = initial_rack_sorted[i]
+            for sku in cluster:
+                sku_to_initial_rack[sku] = rack
+        sku_to_zone = {sku: rack_to_zone[r] for sku, r in sku_to_initial_rack.items()}
+
+        # 8. Zone 간 공동 주문 연관성 계산
+        zone_cooc = defaultdict(int)
+        for _, grp in self.orders.groupby('ORD_NO'):
+            zones = {sku_to_zone[sku] for sku in grp['SKU_CD']}
+            for z1, z2 in combinations(zones, 2):
+                zone_cooc[(z1, z2)] += 1
+                zone_cooc[(z2, z1)] += 1
+
+        # 9. 그리디 휴리스틱으로 최종 Zone 순서 결정
+        w_dist, w_cooc = 0.5, 0.5
+        def zone_score(cur, nxt):
+            return w_cooc * zone_cooc.get((cur, nxt), 0) - w_dist * zone_dist[nxt]
+
+        all_zones = list(zone_to_racks.keys())
+        current = min(all_zones, key=lambda z: zone_dist[z])  # 입구에 가장 가까운 Zone
+        ordered_zones = [current]
+        remaining = set(all_zones) - {current}
+        while remaining:
+            nxt = max(remaining, key=lambda z: zone_score(current, z))
+            ordered_zones.append(nxt)
+            remaining.remove(nxt)
+            current = nxt
+
+        # 10. 최종 rack_sorted 재구성
+        final_rack_sorted = []
+        for z in ordered_zones:
+            racks = zone_to_racks[z][:]
+            racks.sort(key=lambda r: dist_start[r])
+            final_rack_sorted.extend(racks)
+
+        # 11. 최종 SKU→랙 매핑 (클러스터 단위 + 내부 정렬)
+        sku_to_location = {}
+        for idx, cluster in enumerate(clusters):
+            rack = final_rack_sorted[idx]
+            # 랙 내부 정렬: 빈도 70%, 연관성 30%
+            combined = {
+                s: 0.7 * freq.get(s, 0) + 
+                   0.3 * sum(cooc.get((s, t), 0) for t in cluster if t != s)
+                for s in cluster
+            }
+            sorted_skus = sorted(cluster, key=lambda s: combined[s], reverse=True)
+            for sku in sorted_skus:
+                sku_to_location[sku] = rack
+
+        # 12. 결과 반영
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+
+
+# 주문 빈도수, 상품 연관성, 랙 위치의 대칭성을 고려한 SLAP
+# 랙을 zone으로 클러스터링 -> 가까운 zone부터 빈도수 및 연관성
+
+    '''def solve_storage_location(self) -> None:
+        """Solve Storage Location Assignment Problem (SLAP) using SKU frequency, co-occurrence clustering, and spectral clustering for rack zones"""
+        from collections import defaultdict
+        from itertools import combinations
+        import numpy as np
+        from sklearn.cluster import SpectralClustering
+
+        # 1. SKU 출고 빈도 계산
+        if 'NUM_PCS' in self.orders.columns:
+            freq = self.orders.groupby('SKU_CD')['NUM_PCS'].sum()
+        else:
+            freq = self.orders.groupby('SKU_CD').size()
+        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+
+        # 2. SKU 간 공동 주문 연관성 계산
+        cooc = defaultdict(int)
+        for _, group in self.orders.groupby('ORD_NO'):
+            for a, b in combinations(group['SKU_CD'], 2):
+                cooc[(a, b)] += 1
+                cooc[(b, a)] += 1
+
+        # 3. 랙 위치 및 거리 행렬 준비
+        rack_locations = list(self.od_matrix.index[2:])
+        D = self.od_matrix.loc[rack_locations, rack_locations].values
+        # 유사도 행렬 생성 (가우시안 커널)
+        sigma = np.std(D)
+        S = np.exp(-D**2 / (2 * sigma**2))
+
+        # 4. 랙 ZONE 분할 via Spectral Clustering
+        n_clusters = int(np.ceil(len(skus_by_freq) / self.params.rack_capacity))
+        clustering = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='precomputed',
+            assign_labels='kmeans'
+        )
+        labels = clustering.fit_predict(S)
+        zone_to_racks = {}
+        for rack, label in zip(rack_locations, labels):
+            zone_to_racks.setdefault(label, []).append(rack)
+
+        # 5. 랙 순서 결정: 존 순서 + 시작 위치 거리 기준 정렬
+        dist_start = self.od_matrix.loc[self.start_location, rack_locations]
+        rack_sorted = []
+        for label in sorted(zone_to_racks.keys()):
+            racks = zone_to_racks[label]
+            racks.sort(key=lambda r: dist_start[r])
+            rack_sorted.extend(racks)
+
+        # 6. SKU 클러스터링 (빈도 + 연관성)
+        assigned = set()
+        clusters = []
+        for sku in skus_by_freq:
+            if sku in assigned:
+                continue
+            cluster = {sku}
+            candidates = [s for s in skus_by_freq if s not in assigned]
+            candidates.sort(key=lambda x: cooc.get((sku, x), 0), reverse=True)
+            for c in candidates:
+                if len(cluster) < self.params.rack_capacity:
+                    cluster.add(c)
+                else:
+                    break
+            assigned |= cluster
+            clusters.append(cluster)
+
+        # 7. SKU 클러스터를 랙에 매핑
+        sku_to_location = {}
+        for i, cluster in enumerate(clusters):
+            rack = rack_sorted[i] if i < len(rack_sorted) else rack_sorted[i % len(rack_sorted)]
+            for sku in cluster:
+                sku_to_location[sku] = rack
+
+        # 8. 남은 SKU 처리
+        remaining = [s for s in skus_by_freq if s not in sku_to_location]
+        for idx, sku in enumerate(remaining, start=len(clusters)):
+            rack = rack_sorted[idx % len(rack_sorted)]
+            sku_to_location[sku] = rack
+
+        # 9. 결과 반영
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+
+
+#주문 빈도 수와 상품 연관성 고려한 SLAP
+
     def solve_storage_location(self) -> None:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
         from collections import defaultdict
@@ -106,7 +329,7 @@ class WarehouseSolver:
 
         # 결과 반영
         self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
-
+'''
 
     def solve_order_batching(self) -> None:
         """Solve Order Batching and Sequencing Problem (OBSP) using FIFO strategy"""
