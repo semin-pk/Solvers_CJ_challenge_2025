@@ -52,7 +52,7 @@ class WarehouseSolver:
             raise ValueError(f"Missing required columns: {required_columns - set(self.orders.columns)}")
 
 
-    def solve_storage_location(self) -> None:
+    '''def solve_storage_location(self) -> None:
         import networkx as nx
         # 1. SKU frequency
         if 'NUM_PCS' in self.orders.columns:
@@ -172,7 +172,7 @@ class WarehouseSolver:
                 sku_to_location[sku] = rack
 
         # 13. Reflect result
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
 
 
 # ZONE 거리 클러스팅 -> sku 주문빈도 및 연관성 클러스팅 -> ZONE 크기로 sku 더미 생성 -> 그리드 휴리스틱으로 더미끼리의 연관성 파악 -> 연관성 기반 zone 매핑 -> zone 내에 배치 전략 적용
@@ -476,7 +476,7 @@ class WarehouseSolver:
 
 #주문 빈도 수와 상품 연관성 고려한 SLAP
 
-    '''def solve_storage_location(self) -> None:
+    def solve_storage_location(self) -> None:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
         from collections import defaultdict
         from itertools import combinations
@@ -533,7 +533,7 @@ class WarehouseSolver:
             idx += 1
 
         # 결과 반영
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
 
     def solve_order_batching(self) -> None:
         """Solve Order Batching and Sequencing Problem (OBSP) using FIFO strategy"""
