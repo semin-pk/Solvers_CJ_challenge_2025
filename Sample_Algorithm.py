@@ -2,6 +2,9 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Set
+from collections import defaultdict
+from itertools import combinations
+from sklearn.cluster import SpectralClustering
 
 # FIFO로 처리하는 샘플 알고리즘 입니다.
 # def main처럼 데이터프레임 타입으로 결과 리턴해주시면 됩니다. 데이터는 제공한 Sample_OutputData.csv와 동일한 형태로 리턴해주시면 됩니다.
@@ -51,7 +54,7 @@ class WarehouseSolver:
 
 
 # ZONE 거리 클러스팅 -> sku 주문빈도 및 연관성 클러스팅 -> ZONE 크기로 sku 더미 생성 -> 그리드 휴리스틱으로 더미끼리의 연관성 파악 -> 연관성 기반 zone 매핑 -> zone 내에 배치 전략 적용
-    def solve_storage_location(self) -> None:
+    '''def solve_storage_location(self) -> None:
         """Solve SLAP using:
            - SKU 빈도·연관성 기반 클러스터링
            - Spectral Clustering 으로 랙 Zone 분할
@@ -181,14 +184,94 @@ class WarehouseSolver:
                 sku_to_location[sku] = rack
 
         # 12. 결과 반영
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
+    
+    
+    # Re-define fast SLAP solver
+    def solve_storage_location(self) -> pd.DataFrame:
+        import time
+        from itertools import combinations
+        from sklearn.cluster import KMeans
+        from sklearn.decomposition import PCA
+        start_time = time.time()
+        if 'NUM_PCS' in self.orders.columns:
+            freq = self.orders.groupby('SKU_CD')['NUM_PCS'].sum()
+        else:
+            freq = self.orders.groupby('SKU_CD').size()
+        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+
+        cooc = defaultdict(int)
+        top_skus = set(skus_by_freq[:200])
+        for _, grp in self.orders.groupby('ORD_NO'):
+            items = [sku for sku in grp['SKU_CD'] if sku in top_skus]
+            for a, b in combinations(items, 2):
+                cooc[(a, b)] += 1
+                cooc[(b, a)] += 1
+
+        rack_labels = list(self.od_matrix.index[2:])
+        D = self.od_matrix.loc[rack_labels, rack_labels].values
+
+        n_zones = min(int(np.ceil(len(skus_by_freq) / self.params.rack_capacity)), 40)
+        D_sym = (D + D.T) / 2
+        pca = PCA(n_components=10)
+        X = pca.fit_transform(D_sym)
+        clustering = KMeans(n_clusters=n_zones, random_state=0, n_init=10)
+        labels = clustering.fit_predict(X)
+        zone_to_racks = defaultdict(list)
+        rack_to_zone = {}
+        for rack, z in zip(rack_labels, labels):
+            zone_to_racks[z].append(rack)
+            rack_to_zone[rack] = z
+
+        dist_start = self.od_matrix.loc[self.start_location, rack_labels]
+        zone_dist = {
+            z: np.mean([dist_start[r] for r in racks])
+            for z, racks in zone_to_racks.items()
+        }
+
+        initial_ordered_zones = sorted(zone_to_racks.keys(), key=lambda z: zone_dist[z])
+        initial_rack_sorted = []
+        for z in initial_ordered_zones:
+            racks = zone_to_racks[z][:]
+            racks.sort(key=lambda r: dist_start[r])
+            initial_rack_sorted.extend(racks)
+
+        assigned = set()
+        clusters = []
+        for sku in skus_by_freq:
+            if sku in assigned:
+                continue
+            cluster = {sku}
+            for other in skus_by_freq:
+                if other not in assigned and len(cluster) < self.params.rack_capacity:
+                    cluster.add(other)
+            assigned |= cluster
+            clusters.append(cluster)
+
+        sku_to_location = {}
+        for idx, cluster in enumerate(clusters):
+            if idx >= len(initial_rack_sorted):
+                break
+            rack = initial_rack_sorted[idx]
+            sorted_skus = sorted(
+                cluster,
+                key=lambda s: 0.7 * freq.get(s, 0) + 0.3 * sum(cooc.get((s, t), 0) for t in cluster if t != s),
+                reverse=True
+            )
+            for sku in sorted_skus:
+                sku_to_location[sku] = rack
+
         self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
 
+        elapsed_time = time.time() - start_time
+        return self.orders
+    
+    
 
 # 주문 빈도수, 상품 연관성, 랙 위치의 대칭성을 고려한 SLAP
 # 랙을 zone으로 클러스터링 -> 가까운 zone부터 빈도수 및 연관성
-
     '''def solve_storage_location(self) -> None:
-        """Solve Storage Location Assignment Problem (SLAP) using SKU frequency, co-occurrence clustering, and spectral clustering for rack zones"""
+        #Solve Storage Location Assignment Problem (SLAP) using SKU frequency, co-occurrence clustering, and spectral clustering for rack zones
         from collections import defaultdict
         from itertools import combinations
         import numpy as np
@@ -266,12 +349,12 @@ class WarehouseSolver:
             sku_to_location[sku] = rack
 
         # 9. 결과 반영
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
 
 
 #주문 빈도 수와 상품 연관성 고려한 SLAP
 
-    def solve_storage_location(self) -> None:
+    '''def solve_storage_location(self) -> None:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
         from collections import defaultdict
         from itertools import combinations
@@ -328,8 +411,7 @@ class WarehouseSolver:
             idx += 1
 
         # 결과 반영
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
-'''
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
 
     def solve_order_batching(self) -> None:
         """Solve Order Batching and Sequencing Problem (OBSP) using FIFO strategy"""
@@ -363,11 +445,15 @@ def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) 
     return solver.solve()
 
 if __name__ == "__main__":
+    import time
+    test_INPUT = pd.read_csv("./Sample_InputData.csv")
+    test_PARAM = pd.read_csv("./Sample_Parameters.csv")
+    test_OD = pd.read_csv("Sample_OD_Matrix.csv", index_col=0, header=0)
+    start_time = time.time()
     try:
-        test_INPUT = pd.read_csv("./Sample_InputData.csv")
+        '''test_INPUT = pd.read_csv("./Sample_InputData.csv")
         test_PARAM = pd.read_csv("./Sample_Parameters.csv")
-        test_OD = pd.read_csv("Sample_OD_Matrix.csv", index_col=0, header=0)
-
+        test_OD = pd.read_csv("Sample_OD_Matrix.csv", index_col=0, header=0)'''
         print("Data loaded successfully:")
         print(f"- Orders: {test_INPUT.shape}")
         print(f"- Parameters: {test_PARAM.shape}")
@@ -384,3 +470,5 @@ if __name__ == "__main__":
         print(f"Error: Data validation failed - {str(e)}")
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
+    
+    print("total_time : ", time.time() - start_time)
