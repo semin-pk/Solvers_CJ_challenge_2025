@@ -52,6 +52,128 @@ class WarehouseSolver:
             raise ValueError(f"Missing required columns: {required_columns - set(self.orders.columns)}")
 
 
+    def solve_storage_location(self) -> None:
+        import networkx as nx
+        # 1. SKU frequency
+        if 'NUM_PCS' in self.orders.columns:
+            freq = self.orders.groupby('SKU_CD')['NUM_PCS'].sum()
+        else:
+            freq = self.orders.groupby('SKU_CD').size()
+        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+
+        # 2. SKU co-occurrence matrix (Jaccard similarity)
+        order_dict = defaultdict(set)
+        for ord_no, sku in self.orders[['ORD_NO', 'SKU_CD']].values:
+            order_dict[sku].add(ord_no)
+
+        cooc = {}
+        for a, b in combinations(skus_by_freq, 2):
+            inter = len(order_dict[a] & order_dict[b])
+            union = len(order_dict[a] | order_dict[b])
+            if union > 0:
+                jaccard = inter / union
+                cooc[(a, b)] = jaccard
+                cooc[(b, a)] = jaccard
+
+        # 3. Rack distance matrix and similarity
+        rack_labels = list(self.od_matrix.index[2:])
+        D = self.od_matrix.loc[rack_labels, rack_labels].values
+        sigma = np.std(D)
+        S = np.exp(-D**2 / (2 * sigma**2))
+
+        # 4. Spectral Clustering for rack zones
+        n_zones = int(np.ceil(len(skus_by_freq) / self.params.rack_capacity))
+        clustering = SpectralClustering(
+            n_clusters=n_zones,
+            affinity='precomputed',
+            assign_labels='kmeans',
+            random_state=0
+        )
+        labels = clustering.fit_predict(S)
+        zone_to_racks = defaultdict(list)
+        rack_to_zone = {}
+        for rack, z in zip(rack_labels, labels):
+            zone_to_racks[z].append(rack)
+            rack_to_zone[rack] = z
+
+        # 5. Zone entrance distance
+        dist_start = self.od_matrix.loc[self.start_location, rack_labels]
+        zone_dist = {
+            z: np.mean([dist_start[r] for r in racks])
+            for z, racks in zone_to_racks.items()
+        }
+
+        # 6. SKU clustering into rack-sized groups
+        assigned = set()
+        clusters = []
+        for sku in skus_by_freq:
+            if sku in assigned:
+                continue
+            cluster = {sku}
+            candidates = [s for s in skus_by_freq if s not in assigned and s != sku]
+            candidates.sort(key=lambda x: cooc.get((sku, x), 0), reverse=True)
+            for c in candidates:
+                if len(cluster) >= self.params.rack_capacity:
+                    break
+                cluster.add(c)
+            assigned |= cluster
+            clusters.append(cluster)
+
+        # 7. Assign each SKU to a zone
+        sku_to_zone = {}
+        for i, cluster in enumerate(clusters):
+            best_zone = i % n_zones  # initial naive assignment
+            for sku in cluster:
+                sku_to_zone[sku] = best_zone
+
+        # 8. Build zone co-occurrence
+        zone_cooc = defaultdict(int)
+        for _, grp in self.orders.groupby('ORD_NO'):
+            zones = {sku_to_zone.get(sku, -1) for sku in grp['SKU_CD'] if sku in sku_to_zone}
+            zones = list(zones)
+            for i in range(len(zones)):
+                for j in range(i+1, len(zones)):
+                    z1, z2 = zones[i], zones[j]
+                    zone_cooc[(z1, z2)] += 1
+                    zone_cooc[(z2, z1)] += 1
+
+        # 9. Zone graph with distance / (1 + co-occurrence) weights
+        zone_list = list(zone_to_racks.keys())
+        G = nx.Graph()
+        for i, zi in enumerate(zone_list):
+            for j, zj in enumerate(zone_list):
+                if i == j:
+                    continue
+                dist = abs(zone_dist[zi] - zone_dist[zj])
+                cooc_score = zone_cooc.get((zi, zj), 0)
+                weight = dist / (1 + cooc_score)
+                G.add_edge(zi, zj, weight=weight)
+
+        # 10. TSP for zone ordering
+        tsp_path = nx.approximation.traveling_salesman_problem(G, cycle=False)
+        ordered_zones = tsp_path
+
+        # 11. Assign racks based on ordered zones
+        rack_sequence = []
+        for z in ordered_zones:
+            racks = sorted(zone_to_racks[z], key=lambda r: dist_start[r])
+            rack_sequence.extend(racks)
+
+        # 12. SKU to location
+        sku_to_location = {}
+        for cluster, rack in zip(clusters, rack_sequence):
+            combined = {
+                s: 0.6 * freq.get(s, 0) +
+                   0.4 * sum(cooc.get((s, t), 0) for t in cluster if t != s)
+                for s in cluster
+            }
+            sorted_skus = sorted(cluster, key=lambda s: combined[s], reverse=True)
+            for sku in sorted_skus:
+                sku_to_location[sku] = rack
+
+        # 13. Reflect result
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+
 
 # ZONE 거리 클러스팅 -> sku 주문빈도 및 연관성 클러스팅 -> ZONE 크기로 sku 더미 생성 -> 그리드 휴리스틱으로 더미끼리의 연관성 파악 -> 연관성 기반 zone 매핑 -> zone 내에 배치 전략 적용
     '''def solve_storage_location(self) -> None:
@@ -188,7 +310,7 @@ class WarehouseSolver:
     
     
     # Re-define fast SLAP solver
-    def solve_storage_location(self) -> pd.DataFrame:
+    '''def solve_storage_location(self) -> pd.DataFrame:
         import time
         from itertools import combinations
         from sklearn.cluster import KMeans
@@ -264,7 +386,7 @@ class WarehouseSolver:
         self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
 
         elapsed_time = time.time() - start_time
-        return self.orders
+        return self.orders'''
     
     
 

@@ -1,0 +1,6 @@
+PARAMETERS,VALUE,DISCRIPTION
+PT,3,the pick time to pick an SKU (item) (sec)
+CAPA,5,the capacity of a cart in order
+WT,1,the worker speed (m/sec)
+RK,8,the number of SKUs per rack
+PK,12,the number of pickers
