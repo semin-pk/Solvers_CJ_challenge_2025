@@ -56,7 +56,7 @@ class WarehouseSolver:
             raise ValueError(f"Missing required columns: {required_columns - set(self.orders.columns)}")
 
 #SKU 클러스터링 N값 엘보우 기법 적용
-    def solve_storage_location(self) -> None:
+    '''def solve_storage_location(self) -> None:
         import networkx as nx
         from sklearn.cluster import SpectralClustering
         from sklearn.metrics import silhouette_score
@@ -206,12 +206,12 @@ class WarehouseSolver:
         self.rack_to_zone = {}
         for zone, racks in zone_to_racks.items():
             for rack in racks:
-                self.rack_to_zone[rack] = zone
+                self.rack_to_zone[rack] = zone'''
 
 
 
 #랙은 고정이므로 레이아웃만을 사용
-    '''def solve_storage_location(self) -> None:
+    def solve_storage_location(self) -> None:
         import networkx as nx
         epsilon = 1e-3
         # 1️⃣ SKU 빈도
@@ -332,7 +332,7 @@ class WarehouseSolver:
         for zone, racks in zone_to_racks.items():
             for rack in racks:
                 self.rack_to_zone[rack] = zone
-'''
+
 
 #TSP 추가
 
@@ -823,7 +823,7 @@ class WarehouseSolver:
 
 
 #FIFO(OBSP)
-    '''def solve_order_batching(self) -> None:
+    def solve_order_batching(self) -> None:
         """Solve Order Batching and Sequencing Problem (OBSP) using FIFO strategy"""
         unique_orders = sorted(self.orders['ORD_NO'].unique())
         num_carts = len(unique_orders) // self.params.cart_capacity + 1
@@ -836,7 +836,7 @@ class WarehouseSolver:
             for order in cart_orders:
                 order_to_cart[order] = cart_no
 
-        self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)'''
+        self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)
 
 #ZONE Spectral clustering
     '''def solve_order_batching(self) -> None:
@@ -902,7 +902,7 @@ class WarehouseSolver:
         self.orders['SEQ'] = self.orders['CART_NO'].map(cart_to_seq)
 '''
 # zone Spectral clustering x
-    def solve_order_batching(self) -> None:
+    '''def solve_order_batching(self) -> None:
         """OBSP: 주문 유사도 + ZONE 순서를 고려한 카트 배치 및 순서"""
         from collections import defaultdict
 
@@ -962,7 +962,7 @@ class WarehouseSolver:
         cart_to_seq = {cart: idx+1 for idx, cart in enumerate(cart_order)}
 
         self.orders['SEQ'] = self.orders['CART_NO'].map(cart_to_seq)
-
+'''
 
     def solve_picker_routing(self) -> None:
         """Solve Pick Routing Problem (PRP) using simple sequencing"""
