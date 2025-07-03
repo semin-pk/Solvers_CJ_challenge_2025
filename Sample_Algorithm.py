@@ -222,7 +222,7 @@ class WarehouseSolver:
         order_dict = defaultdict(set)
         for ord_no, sku in self.orders[['ORD_NO', 'SKU_CD']].values:
             order_dict[sku].add(ord_no)
-
+        #n_clusters = int(self.orders['NUM_PCS'].sum() / self.params.cart_capacity)
         self.cooc = {}
         for a, b in combinations(skus_by_freq, 2):
             inter = len(order_dict[a] & order_dict[b])
@@ -823,7 +823,7 @@ class WarehouseSolver:
 
 
 #FIFO(OBSP)
-    def solve_order_batching(self) -> None:
+    '''def solve_order_batching(self) -> None:
         """Solve Order Batching and Sequencing Problem (OBSP) using FIFO strategy"""
         unique_orders = sorted(self.orders['ORD_NO'].unique())
         num_carts = len(unique_orders) // self.params.cart_capacity + 1
@@ -836,7 +836,7 @@ class WarehouseSolver:
             for order in cart_orders:
                 order_to_cart[order] = cart_no
 
-        self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)
+        self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)'''
 
 #ZONE Spectral clustering
     '''def solve_order_batching(self) -> None:
@@ -902,7 +902,7 @@ class WarehouseSolver:
         self.orders['SEQ'] = self.orders['CART_NO'].map(cart_to_seq)
 '''
 # zone Spectral clustering x
-    '''def solve_order_batching(self) -> None:
+    def solve_order_batching(self) -> None:
         """OBSP: 주문 유사도 + ZONE 순서를 고려한 카트 배치 및 순서"""
         from collections import defaultdict
 
@@ -962,7 +962,7 @@ class WarehouseSolver:
         cart_to_seq = {cart: idx+1 for idx, cart in enumerate(cart_order)}
 
         self.orders['SEQ'] = self.orders['CART_NO'].map(cart_to_seq)
-'''
+
 
     def solve_picker_routing(self) -> None:
         """Solve Pick Routing Problem (PRP) using simple sequencing"""
