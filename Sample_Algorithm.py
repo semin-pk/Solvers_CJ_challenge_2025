@@ -28,6 +28,10 @@ class WarehouseSolver:
         self._initialize_orders()
         self._validate_input()
 
+        self.cooc = None
+        self.zone_cooc = None, 
+        self.ordered_zone = None
+        self.rack_to_zone = None
     def _load_parameters(self, parameters: pd.DataFrame) -> WarehouseParameters:
         get_param = lambda x: parameters.loc[parameters['PARAMETERS'] == x, 'VALUE'].iloc[0]
         return WarehouseParameters(
@@ -51,6 +55,286 @@ class WarehouseSolver:
         if not required_columns.issubset(self.orders.columns):
             raise ValueError(f"Missing required columns: {required_columns - set(self.orders.columns)}")
 
+#SKU 클러스터링 N값 엘보우 기법 적용
+    def solve_storage_location(self) -> None:
+        import networkx as nx
+        from sklearn.cluster import SpectralClustering
+        from sklearn.metrics import silhouette_score
+        import numpy as np
+        from collections import defaultdict
+        from itertools import combinations
+
+        # 1️⃣ SKU 빈도
+        freq = self.orders.groupby('SKU_CD').size()
+        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+
+        # 2️⃣ SKU 간 공출현 (Jaccard)
+        order_dict = defaultdict(set)
+        for ord_no, sku in self.orders[['ORD_NO', 'SKU_CD']].values:
+            order_dict[sku].add(ord_no)
+
+        self.cooc = {}
+        for a, b in combinations(skus_by_freq, 2):
+            inter = len(order_dict[a] & order_dict[b])
+            union = len(order_dict[a] | order_dict[b])
+            if union > 0:
+                jaccard = inter / union
+                self.cooc[(a, b)] = jaccard
+                self.cooc[(b, a)] = jaccard
+
+        # 3️⃣ SKU 유사도 행렬
+        S_sku = np.zeros((len(skus_by_freq), len(skus_by_freq)))
+        for i, a in enumerate(skus_by_freq):
+            for j, b in enumerate(skus_by_freq):
+                S_sku[i, j] = self.cooc.get((a, b), 0)
+
+        # 4️⃣ 엘보우 기법으로 최적 클러스터 수
+        max_k = len(skus_by_freq) // self.params.rack_capacity
+        if max_k < 2:
+            max_k = 2
+        max_k = min(max_k, 10)
+
+        best_k, best_score = 2, -1
+        for k in range(2, max_k+1):
+            clustering = SpectralClustering(
+                n_clusters=k,
+                affinity='precomputed',
+                assign_labels='discretize',
+                random_state=0
+            )
+            labels = clustering.fit_predict(S_sku)
+            try:
+                score = silhouette_score(S_sku, labels, metric='precomputed')
+            except Exception:
+                score = -1
+            if score > best_score:
+                best_k = k
+                best_score = score
+
+        n_clusters = best_k
+
+        # 5️⃣ 최적 k로 클러스터링
+        clustering = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='precomputed',
+            assign_labels='discretize',
+            random_state=0
+        )
+        sku_cluster_labels = clustering.fit_predict(S_sku)
+
+        sku_to_cluster = {sku: cluster for sku, cluster in zip(skus_by_freq, sku_cluster_labels)}
+
+        # 6️⃣ 군집별 SKU 모음
+        cluster_to_skus = defaultdict(list)
+        for sku, cluster in sku_to_cluster.items():
+            cluster_to_skus[cluster].append(sku)
+
+        # 7️⃣ Zone 정보
+        rack_labels = list(self.od_matrix.index[2:])
+        zone_labels = list(set(rack_labels))
+        zone_dist_start = self.od_matrix.loc[self.start_location, zone_labels].to_dict()
+        ordered_zones = sorted(zone_labels, key=lambda z: zone_dist_start[z])
+
+        # Zone ↔ 랙 매핑 및 용량
+        zone_to_racks = {z: [z] for z in zone_labels}
+        zone_remaining = {
+            z: len(racks) * self.params.rack_capacity
+            for z, racks in zone_to_racks.items()
+        }
+
+        # 공출현 기반 군집 순서
+        cluster_graph = nx.Graph()
+        cluster_ids = list(cluster_to_skus.keys())
+        for c1, c2 in combinations(cluster_ids, 2):
+            weight = 0
+            for sku1 in cluster_to_skus[c1]:
+                for sku2 in cluster_to_skus[c2]:
+                    weight += self.cooc.get((sku1, sku2), 0)
+            cluster_graph.add_edge(c1, c2, weight=weight)
+
+        cluster_order = sorted(
+            cluster_graph.nodes,
+            key=lambda c: -sum(attr['weight'] for attr in dict(cluster_graph[c]).values())
+        )
+
+        # 8️⃣ SKU → Zone & 랙 매핑 (분할 배정)
+        sku_to_loc = {}
+        rack_capacity = self.params.rack_capacity
+
+        for c in cluster_order:
+            skus_in_cluster = cluster_to_skus[c]
+            sku_idx = 0
+
+            for z in ordered_zones:
+                if sku_idx >= len(skus_in_cluster):
+                    break
+
+                racks_in_zone = zone_to_racks[z]
+                racks_in_zone_sorted = sorted(
+                    racks_in_zone,
+                    key=lambda r: self.od_matrix.loc[self.start_location, r]
+                )
+
+                current_rack_idx = 0
+                current_rack_fill = 0
+
+                while sku_idx < len(skus_in_cluster) and zone_remaining[z] > 0:
+                    if current_rack_fill >= rack_capacity:
+                        current_rack_idx += 1
+                        current_rack_fill = 0
+                    if current_rack_idx >= len(racks_in_zone_sorted):
+                        break
+
+                    sku = skus_in_cluster[sku_idx]
+                    rack = racks_in_zone_sorted[current_rack_idx]
+
+                    sku_to_loc[sku] = rack
+                    current_rack_fill += 1
+                    zone_remaining[z] -= 1
+                    sku_idx += 1
+
+            if sku_idx < len(skus_in_cluster):
+                raise ValueError(
+                    f"전체 Zone에 충분한 용량이 없어 cluster {c}의 SKU 일부를 배치하지 못했습니다."
+                )
+
+        # 🔟 결과 반영
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_loc)
+
+        # 속성에 추가
+        self.ordered_zone = ordered_zones
+        self.rack_to_zone = {}
+        for zone, racks in zone_to_racks.items():
+            for rack in racks:
+                self.rack_to_zone[rack] = zone
+
+
+
+#랙은 고정이므로 레이아웃만을 사용
+    '''def solve_storage_location(self) -> None:
+        import networkx as nx
+        epsilon = 1e-3
+        # 1️⃣ SKU 빈도
+        freq = self.orders.groupby('SKU_CD').size()
+        skus_by_freq = freq.sort_values(ascending=False).index.tolist()
+
+        # 2️⃣ SKU 간 공출현 (Jaccard)
+        order_dict = defaultdict(set)
+        for ord_no, sku in self.orders[['ORD_NO', 'SKU_CD']].values:
+            order_dict[sku].add(ord_no)
+
+        self.cooc = {}
+        for a, b in combinations(skus_by_freq, 2):
+            inter = len(order_dict[a] & order_dict[b])
+            union = len(order_dict[a] | order_dict[b])
+            if union > 0:
+                jaccard = inter / union
+                self.cooc[(a, b)] = jaccard
+                self.cooc[(b, a)] = jaccard
+
+        # 3️⃣ SKU 클러스터링
+        n_clusters = int(np.ceil(len(skus_by_freq) / self.params.rack_capacity))
+        sku_labels = skus_by_freq
+        S_sku = np.zeros((len(sku_labels), len(sku_labels)))
+        for i, a in enumerate(sku_labels):
+            for j, b in enumerate(sku_labels):
+                S_sku[i, j] = self.cooc.get((a, b), epsilon)
+
+        clustering = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='precomputed',
+            assign_labels='discretize', #Kmean
+            random_state=0
+        )
+        sku_cluster_labels = clustering.fit_predict(S_sku)
+
+        sku_to_cluster = {sku: cluster for sku, cluster in zip(sku_labels, sku_cluster_labels)}
+
+        # 4️⃣ 클러스터별 SKU 모음
+        cluster_to_skus = defaultdict(list)
+        for sku, cluster in sku_to_cluster.items():
+            cluster_to_skus[cluster].append(sku)
+
+        # 5️⃣ Zone 정보
+        rack_labels = list(self.od_matrix.index[2:])
+        zone_labels = list(set(rack_labels))
+        zone_dist_start = self.od_matrix.loc[self.start_location, zone_labels].to_dict()
+        ordered_zones = sorted(zone_labels, key=lambda z: zone_dist_start[z])
+
+        # Zone ↔ 랙 매핑 및 용량
+        zone_to_racks = {z: [z] for z in zone_labels}
+        zone_remaining = {
+            z: len(racks) * self.params.rack_capacity
+            for z, racks in zone_to_racks.items()
+        }
+
+        # 공출현 기반 클러스터 순서
+        cluster_graph = nx.Graph()
+        for c1, c2 in combinations(range(n_clusters), 2):
+            weight = 0
+            for sku1 in cluster_to_skus[c1]:
+                for sku2 in cluster_to_skus[c2]:
+                    weight += self.cooc.get((sku1, sku2), epsilon)
+            cluster_graph.add_edge(c1, c2, weight=weight)
+
+        cluster_order = sorted(
+            cluster_graph.nodes,
+            key=lambda c: -sum(attr['weight'] for attr in dict(cluster_graph[c]).values())
+        )
+
+        # SKU → Zone & 랙 매핑 (분할 배정)
+        sku_to_loc = {}
+        rack_capacity = self.params.rack_capacity
+
+        for c in cluster_order:
+            skus_in_cluster = cluster_to_skus[c]
+            sku_idx = 0
+
+            for z in ordered_zones:
+                if sku_idx >= len(skus_in_cluster):
+                    break
+
+                racks_in_zone = zone_to_racks[z]
+                racks_in_zone_sorted = sorted(
+                    racks_in_zone,
+                    key=lambda r: self.od_matrix.loc[self.start_location, r]
+                )
+
+                current_rack_idx = 0
+                current_rack_fill = 0
+
+                while sku_idx < len(skus_in_cluster) and zone_remaining[z] > 0:
+                    if current_rack_fill >= rack_capacity:
+                        current_rack_idx += 1
+                        current_rack_fill = 0
+                    if current_rack_idx >= len(racks_in_zone_sorted):
+                        break
+
+                    sku = skus_in_cluster[sku_idx]
+                    rack = racks_in_zone_sorted[current_rack_idx]
+
+                    sku_to_loc[sku] = rack
+                    current_rack_fill += 1
+                    zone_remaining[z] -= 1
+                    sku_idx += 1
+
+            if sku_idx < len(skus_in_cluster):
+                raise ValueError(
+                    f"전체 Zone에 충분한 용량이 없어 cluster {c}의 SKU 일부를 배치하지 못했습니다."
+                )
+
+        # 결과 반영
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_loc)
+
+        # 속성에 추가
+        self.ordered_zone = ordered_zones
+        self.rack_to_zone = {}
+        for zone, racks in zone_to_racks.items():
+            for rack in racks:
+                self.rack_to_zone[rack] = zone
+'''
+
+#TSP 추가
 
     '''def solve_storage_location(self) -> None:
         import networkx as nx
@@ -170,10 +454,13 @@ class WarehouseSolver:
             sorted_skus = sorted(cluster, key=lambda s: combined[s], reverse=True)
             for sku in sorted_skus:
                 sku_to_location[sku] = rack
-
+        self.cooc = cooc
+        self.rack_to_zone = rack_to_zone
+        self.ordered_zones = ordered_zones
+        self.zone_cooc = zone_cooc
         # 13. Reflect result
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
-
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+'''
 
 # ZONE 거리 클러스팅 -> sku 주문빈도 및 연관성 클러스팅 -> ZONE 크기로 sku 더미 생성 -> 그리드 휴리스틱으로 더미끼리의 연관성 파악 -> 연관성 기반 zone 매핑 -> zone 내에 배치 전략 적용
     '''def solve_storage_location(self) -> None:
@@ -476,7 +763,7 @@ class WarehouseSolver:
 
 #주문 빈도 수와 상품 연관성 고려한 SLAP
 
-    def solve_storage_location(self) -> None:
+    '''def solve_storage_location(self) -> None:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
         from collections import defaultdict
         from itertools import combinations
@@ -494,7 +781,7 @@ class WarehouseSolver:
             for a, b in combinations(group['SKU_CD'], 2):
                 cooc[(a, b)] += 1
                 cooc[(b, a)] += 1
-
+        self.cooc = cooc
         # 3. 시작 지점에서 가까운 랙부터 정렬
         rack_locations = self.od_matrix.index[2:]
         dist_start = self.od_matrix.loc[self.start_location, rack_locations]
@@ -531,11 +818,12 @@ class WarehouseSolver:
             rack = rack_sorted[idx // self.params.rack_capacity]
             sku_to_location[sku] = rack
             idx += 1
-
         # 결과 반영
-        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
+        self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)'''
 
-    def solve_order_batching(self) -> None:
+
+#FIFO(OBSP)
+    '''def solve_order_batching(self) -> None:
         """Solve Order Batching and Sequencing Problem (OBSP) using FIFO strategy"""
         unique_orders = sorted(self.orders['ORD_NO'].unique())
         num_carts = len(unique_orders) // self.params.cart_capacity + 1
@@ -548,7 +836,133 @@ class WarehouseSolver:
             for order in cart_orders:
                 order_to_cart[order] = cart_no
 
+        self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)'''
+
+#ZONE Spectral clustering
+    '''def solve_order_batching(self) -> None:
+        """OBSP: 주문 유사도 + ZONE 순서를 고려한 카트 배치 및 순서"""
+        from collections import defaultdict
+        import numpy as np
+
+        # 1. 주문별 SKU 집합
+        order_skus = self.orders.groupby('ORD_NO')['SKU_CD'].apply(list).to_dict()
+        order_zones = {}
+        for ord_no, skus in order_skus.items():
+            zones = {self.rack_to_zone.get(self.orders.loc[self.orders['SKU_CD'] == sku, 'LOC'].iat[0], -1)
+                     for sku in skus}
+            order_zones[ord_no] = zones
+
+        order_ids = list(order_skus.keys())
+
+        # 2. 주문 간 유사도 계산
+        order_sim = defaultdict(float)
+        for i in range(len(order_ids)):
+            for j in range(i+1, len(order_ids)):
+                o1, o2 = order_ids[i], order_ids[j]
+                sim = sum(self.cooc.get((s1, s2), 0) for s1 in order_skus[o1] for s2 in order_skus[o2])
+                order_sim[(o1, o2)] = sim
+                order_sim[(o2, o1)] = sim
+
+        # 3. 주문별 유사 이웃 정렬
+        neighbors = {o: [] for o in order_ids}
+        for (o1, o2), sim in order_sim.items():
+            neighbors[o1].append((o2, sim))
+        for o in neighbors:
+            neighbors[o].sort(key=lambda x: -x[1])
+
+        # 4. Greedy Batching
+        assigned = set()
+        order_to_cart = {}
+        cart_no = 1
+        for o in order_ids:
+            if o in assigned:
+                continue
+            batch = [o]
+            assigned.add(o)
+            for cand, _ in neighbors[o]:
+                if len(batch) >= self.params.cart_capacity:
+                    break
+                if cand not in assigned:
+                    batch.append(cand)
+                    assigned.add(cand)
+            for ord_id in batch:
+                order_to_cart[ord_id] = cart_no
+            cart_no += 1
         self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)
+
+        # 5. CART_NO별 ZONE 순서 기반 SEQ 부여
+        cart_zones = self.orders.groupby('CART_NO')['LOC'].apply(lambda locs:
+            set(self.rack_to_zone[l] for l in locs if l in self.rack_to_zone)).to_dict()
+
+        cart_order = sorted(cart_zones.keys(), key=lambda c: [
+            self.ordered_zones.index(z) for z in cart_zones[c] if z in self.ordered_zones
+        ])
+        cart_to_seq = {cart: idx+1 for idx, cart in enumerate(cart_order)}
+
+        self.orders['SEQ'] = self.orders['CART_NO'].map(cart_to_seq)
+'''
+# zone Spectral clustering x
+    def solve_order_batching(self) -> None:
+        """OBSP: 주문 유사도 + ZONE 순서를 고려한 카트 배치 및 순서"""
+        from collections import defaultdict
+
+        # 1. 주문별 SKU 집합
+        order_skus = self.orders.groupby('ORD_NO')['SKU_CD'].apply(list).to_dict()
+        order_zones = {}
+        for ord_no, skus in order_skus.items():
+            zones = {self.rack_to_zone.get(self.orders.loc[self.orders['SKU_CD'] == sku, 'LOC'].iat[0], -1)
+                     for sku in skus}
+            order_zones[ord_no] = zones
+
+        order_ids = list(order_skus.keys())
+
+        # 2. 주문 간 유사도 계산
+        order_sim = defaultdict(float)
+        for i in range(len(order_ids)):
+            for j in range(i+1, len(order_ids)):
+                o1, o2 = order_ids[i], order_ids[j]
+                sim = sum(self.cooc.get((s1, s2), 0) for s1 in order_skus[o1] for s2 in order_skus[o2])
+                order_sim[(o1, o2)] = sim
+                order_sim[(o2, o1)] = sim
+
+        # 3. 주문별 유사 이웃 정렬
+        neighbors = {o: [] for o in order_ids}
+        for (o1, o2), sim in order_sim.items():
+            neighbors[o1].append((o2, sim))
+        for o in neighbors:
+            neighbors[o].sort(key=lambda x: -x[1])
+
+        # 4. Greedy Batching
+        assigned = set()
+        order_to_cart = {}
+        cart_no = 1
+        for o in order_ids:
+            if o in assigned:
+                continue
+            batch = [o]
+            assigned.add(o)
+            for cand, _ in neighbors[o]:
+                if len(batch) >= self.params.cart_capacity:
+                    break
+                if cand not in assigned:
+                    batch.append(cand)
+                    assigned.add(cand)
+            for ord_id in batch:
+                order_to_cart[ord_id] = cart_no
+            cart_no += 1
+        self.orders['CART_NO'] = self.orders['ORD_NO'].map(order_to_cart)
+
+        # 5. CART_NO별 ZONE 순서 기반 SEQ 부여
+        cart_zones = self.orders.groupby('CART_NO')['LOC'].apply(lambda locs:
+            set(self.rack_to_zone[l] for l in locs if l in self.rack_to_zone)).to_dict()
+
+        cart_order = sorted(cart_zones.keys(), key=lambda c: [
+            self.ordered_zone.index(z) for z in cart_zones[c] if z in self.ordered_zone
+        ])
+        cart_to_seq = {cart: idx+1 for idx, cart in enumerate(cart_order)}
+
+        self.orders['SEQ'] = self.orders['CART_NO'].map(cart_to_seq)
+
 
     def solve_picker_routing(self) -> None:
         """Solve Pick Routing Problem (PRP) using simple sequencing"""
@@ -560,6 +974,12 @@ class WarehouseSolver:
         self.solve_storage_location()
         self.solve_order_batching()
         self.solve_picker_routing()
+        if self.orders['LOC'].isna().any():
+            raise ValueError("LOC에 할당되지 않은 SKU가 있습니다.")
+        if self.orders['CART_NO'].isna().any():
+            raise ValueError("CART_NO가 지정되지 않았습니다.")
+        if self.orders['SEQ'].isna().any():
+            raise ValueError("SEQ가 지정되지 않았습니다.")
         return self.orders
 
 def main(INPUT: pd.DataFrame, PARAMETER: pd.DataFrame, OD_MATRIX: pd.DataFrame) -> pd.DataFrame:
