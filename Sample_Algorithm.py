@@ -884,7 +884,7 @@ class WarehouseSolver:
                 self.rack_to_zone[rack] = zone'''
 
 
-#주문 빈도 수와 상품 연관성 고려한 SLAP
+#주문 빈도수와 상품 연관성 고려한 SLAP
 
     def solve_storage_location(self) -> None:
         """Solve Storage Location Assignment Problem (SLAP) using SKU frequency and co-occurrence clustering"""
@@ -941,7 +941,7 @@ class WarehouseSolver:
             rack = rack_sorted[idx // self.params.rack_capacity]
             sku_to_location[sku] = rack
             idx += 1
-        print(len(remaining))
+        #print(len(remaining))
         # 결과 반영
         self.orders['LOC'] = self.orders['SKU_CD'].map(sku_to_location)
 
