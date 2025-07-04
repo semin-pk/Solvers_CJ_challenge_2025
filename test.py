@@ -64,12 +64,12 @@ def evaluate_completion_time(
 
 from Sample_Algorithm import main  # 이미 구현한 main 함수
 import time
-"""test_INPUT = pd.read_csv("test_data/InputData.csv")
-test_PARAM = pd.read_csv("test_data/Parameters.csv")
-test_OD = pd.read_csv("test_data/OD_Matrix.csv", index_col=0, header=0)"""
 test_INPUT = pd.read_csv("sample_data/InputData.csv")
 test_PARAM = pd.read_csv("sample_data/Parameters.csv")
 test_OD = pd.read_csv("sample_data/OD_Matrix.csv", index_col=0, header=0)
+'''test_INPUT = pd.read_csv("test_data/InputData_Linked_6p.csv")
+test_PARAM = pd.read_csv("test_data/Parameters_Linked_6p.csv")
+test_OD = pd.read_csv("test_data/OD_Matrix_Linked_6p.csv", index_col=0, header=0)'''
 start_time = time.time()
 score = evaluate_completion_time(
     main_func=main,
